@@ -1,0 +1,306 @@
+'use strict';
+/**
+ * lightning.js — AgentLightning Integration (Iterative Learning Loop).
+ *
+ * Integrates: microsoft/agent-lightning — github.com/microsoft/agent-lightning
+ *
+ * AgentLightning enables reinforcement-learning training of agents with
+ * virtually zero code changes. It runs as a side-car server that:
+ *   1. Intercepts LLM calls from agents via an LLM Proxy
+ *   2. Collects spans (execution traces) into a Lightning Store
+ *   3. Assigns rewards based on task outcomes (error files, test results, git blame)
+ *   4. Runs RL/APO (Automatic Prompt Optimization) to improve agent prompts
+ *
+ * Where it fits in the architecture:
+ *   "iterative learning" arc — runs continuously ALONGSIDE agents.
+ *   "errors / gaps" arrow   — when agents write to .zeroclaw/errors/,
+ *                             Lightning picks them up as negative reward signals.
+ *   "AgentLightning Reinforced learning" box — the training loop itself.
+ *
+ * In this integration we use AgentLightning in "APO" mode (Automatic Prompt
+ * Optimization) since we don't need a GPU cluster — it just needs an LLM.
+ * Full RL fine-tuning is available if verl + GPU are present.
+ *
+ * Architecture:
+ *   Lightning LLM Proxy   (port 8765)  ← agents send LLM calls here
+ *   Lightning Store        (port 8766)  ← collects spans / rewards
+ *   Lightning Trainer               ← analyses spans, updates prompts
+ *   File Watcher                    ← watches .zeroclaw/errors/ for signals
+ */
+
+const path     = require('path');
+const fs       = require('fs-extra');
+const execa    = require('execa');
+const chokidar = require('chokidar');
+const chalk    = require('chalk');
+const ora      = require('ora');
+const { log }  = require('./ui');
+
+const LIGHTNING_PROXY_PORT = 8765;
+const LIGHTNING_STORE_PORT = 8766;
+
+class Lightning {
+  constructor(workspace) {
+    this.workspace   = workspace;
+    this.errorsDir   = path.join(workspace, '.zeroclaw', 'errors');
+    this.spansDir    = path.join(workspace, '.zeroclaw', 'lightning-spans');
+    this.promptsDir  = path.join(workspace, '.zeroclaw', 'lightning-prompts');
+    this.serverProc  = null;
+    this.watcher     = null;
+    this.rewardLog   = [];
+    this.installed   = false;
+  }
+
+  /* ── Lifecycle ──────────────────────────────────────────────────── */
+
+  async start() {
+    await fs.ensureDir(this.errorsDir);
+    await fs.ensureDir(this.spansDir);
+    await fs.ensureDir(this.promptsDir);
+
+    this.installed = await this._checkInstalled();
+
+    if (this.installed) {
+      await this._startLightningServer();
+    } else {
+      log.warn('AgentLightning not installed. Running in lightweight reward-watcher mode.');
+      log.warn('Install: pip install agentlightning');
+    }
+
+    // Always start the file watcher — works with or without AgentLightning
+    this._startErrorWatcher();
+    this._startSpanWatcher();
+
+    log.info(
+      chalk.magenta('[AgentLightning] ') +
+      (this.installed
+        ? `RL server running  proxy=:${LIGHTNING_PROXY_PORT}  store=:${LIGHTNING_STORE_PORT}`
+        : 'Lightweight mode  (watching .zeroclaw/errors/ for reward signals)')
+    );
+  }
+
+  async stop() {
+    if (this.watcher)     await this.watcher.close();
+    if (this.serverProc)  this.serverProc.kill();
+
+    // Write session reward summary
+    const summaryPath = path.join(this.workspace, '.zeroclaw', 'lightning-summary.json');
+    await fs.writeJson(summaryPath, {
+      sessionId: new Date().toISOString(),
+      rewards:   this.rewardLog,
+      total:     this.rewardLog.reduce((s, r) => s + r.score, 0)
+    }, { spaces: 2 });
+
+    log.info(chalk.magenta('[AgentLightning] ') + `Session summary written → ${summaryPath}`);
+  }
+
+  /* ── AgentLightning server ──────────────────────────────────────── */
+
+  async _startLightningServer() {
+    const spinner = ora('Starting AgentLightning server...').start();
+    try {
+      // agentlightning start --proxy-port 8765 --store-port 8766
+      this.serverProc = execa('agentlightning', [
+        'start',
+        '--proxy-port', String(LIGHTNING_PROXY_PORT),
+        '--store-port',  String(LIGHTNING_STORE_PORT),
+        '--workspace',   this.workspace
+      ], {
+        cwd:         this.workspace,
+        stdio:       'pipe',
+        detached:    false
+      });
+
+      // Give it a moment to bind
+      await new Promise(r => setTimeout(r, 2000));
+      spinner.succeed('AgentLightning server started');
+
+      // Point agents at the proxy via env var (written to .zeroclaw/agent-env.sh)
+      await this._writeAgentEnv();
+    } catch (err) {
+      spinner.fail(`AgentLightning server failed to start: ${err.message}`);
+      this.serverProc = null;
+    }
+  }
+
+  async _writeAgentEnv() {
+    // Agents source this file to route LLM calls through Lightning's proxy
+    const envFile = path.join(this.workspace, '.zeroclaw', 'agent-env.sh');
+    await fs.writeFile(envFile, [
+      '#!/usr/bin/env bash',
+      '# Auto-generated by zeroclaw — sources AgentLightning proxy settings',
+      `export OPENAI_BASE_URL="http://localhost:${LIGHTNING_PROXY_PORT}/v1"`,
+      `export OPENAI_API_BASE="http://localhost:${LIGHTNING_PROXY_PORT}/v1"`,
+      `export LIGHTNING_STORE_URL="http://localhost:${LIGHTNING_STORE_PORT}"`,
+      `export LIGHTNING_WORKSPACE="${this.workspace}"`,
+      ''
+    ].join('\n'));
+  }
+
+  /* ── Reward signal collection ───────────────────────────────────── */
+
+  /**
+   * Watch .zeroclaw/errors/ for error files written by agents.
+   * Each error file generates a negative reward signal.
+   * Conversely, monitor git commits for positive reward signals.
+   */
+  _startErrorWatcher() {
+    this.watcher = chokidar.watch(this.errorsDir, {
+      ignoreInitial: true,
+      persistent:    true
+    });
+
+    this.watcher.on('add', async (filePath) => {
+      const content = await fs.readFile(filePath, 'utf8').catch(() => '');
+      const agent   = path.basename(filePath).split('-')[0];
+
+      log.warn(chalk.magenta('[AgentLightning] ') + `Error signal from ${agent}: ${path.basename(filePath)}`);
+
+      const reward = { agent, file: filePath, score: -1, type: 'error', ts: Date.now() };
+      this.rewardLog.push(reward);
+
+      if (this.installed) {
+        await this._submitReward(reward, content);
+        await this._triggerLearning(agent);
+      } else {
+        // Lightweight: write analysis to prompts dir
+        await this._lightweightAnalysis(agent, content);
+      }
+    });
+  }
+
+  _startSpanWatcher() {
+    // Watch for span files written by agents (successful task completions)
+    const spansWatcher = chokidar.watch(this.spansDir, {
+      ignoreInitial: true, persistent: true
+    });
+
+    spansWatcher.on('add', async (filePath) => {
+      const content = await fs.readFile(filePath, 'utf8').catch(() => '{}');
+      const span    = JSON.parse(content);
+      const agent   = span.agent || 'unknown';
+
+      if (span.success) {
+        const reward = { agent, score: 1, type: 'success', task: span.task, ts: Date.now() };
+        this.rewardLog.push(reward);
+        log.info(chalk.magenta('[AgentLightning] ') + `✓ Positive reward: ${agent} completed "${span.task}"`);
+
+        if (this.installed) await this._submitReward(reward, content);
+      }
+    });
+  }
+
+  /* ── Learning triggers ──────────────────────────────────────────── */
+
+  /**
+   * Submit a reward to the Lightning Store.
+   * AgentLightning's LightningRL credit-assignment module will
+   * determine which LLM calls contributed to the outcome.
+   */
+  async _submitReward(reward, context) {
+    try {
+      const { default: fetch } = await import('node-fetch').catch(() => ({ default: null }));
+      if (!fetch) return;
+
+      await fetch(`http://localhost:${LIGHTNING_STORE_PORT}/api/reward`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ...reward, context })
+      });
+    } catch { /* store might not be up */ }
+  }
+
+  /**
+   * Trigger an APO (Automatic Prompt Optimization) cycle for an agent.
+   * AgentLightning analyses recent spans and produces an improved prompt.
+   */
+  async _triggerLearning(agent) {
+    const promptOut = path.join(this.promptsDir, `${agent}-improved.md`);
+    try {
+      await execa('agentlightning', [
+        'optimize',
+        '--agent',      agent,
+        '--algorithm',  'apo',
+        '--output',     promptOut,
+        '--store-url',  `http://localhost:${LIGHTNING_STORE_PORT}`
+      ], { stdio: 'pipe', cwd: this.workspace });
+
+      log.info(chalk.magenta('[AgentLightning] ') + `Prompt optimized for ${agent} → ${promptOut}`);
+
+      // Inject the improved prompt into the agent's next task file
+      await this._injectImprovedPrompt(agent, promptOut);
+    } catch (err) {
+      log.warn(chalk.magenta('[AgentLightning] ') + `APO failed for ${agent}: ${err.message}`);
+    }
+  }
+
+  async _injectImprovedPrompt(agent, promptFile) {
+    if (!await fs.pathExists(promptFile)) return;
+    const improved = await fs.readFile(promptFile, 'utf8');
+    const taskFile = path.join(this.workspace, '.zeroclaw', `${agent}-task.md`);
+    if (await fs.pathExists(taskFile)) {
+      const current = await fs.readFile(taskFile, 'utf8');
+      const updated = current + `\n\n---\n## AgentLightning Optimized Guidance\n${improved}\n`;
+      await fs.writeFile(taskFile, updated);
+    }
+  }
+
+  /**
+   * Lightweight fallback: no AgentLightning server.
+   * Analyse error files with heuristics and write improvement notes.
+   */
+  async _lightweightAnalysis(agent, errorContent) {
+    const analysis = this._analyseError(errorContent);
+    const outPath  = path.join(this.promptsDir, `${agent}-hints-${Date.now()}.md`);
+    await fs.writeFile(outPath, [
+      `# AgentLightning Lightweight Analysis`,
+      `Agent: ${agent}  |  Time: ${new Date().toISOString()}`,
+      '',
+      '## Error Pattern',
+      `\`\`\`\n${errorContent.slice(0, 500)}\n\`\`\``,
+      '',
+      '## Suggested Improvement',
+      analysis,
+      ''
+    ].join('\n'));
+
+    log.info(chalk.magenta('[AgentLightning] ') + `Lightweight analysis → ${outPath}`);
+  }
+
+  _analyseError(content) {
+    const c = content.toLowerCase();
+    if (/syntax error|unexpected token/.test(c))       return 'Check syntax — common cause: missing brackets or wrong indentation.';
+    if (/module not found|cannot find module/.test(c)) return 'Install missing dependency: npm install <package> or pip install <package>.';
+    if (/timeout|timed out/.test(c))                   return 'Task may be too large — break it into smaller subtasks.';
+    if (/permission denied/.test(c))                   return 'File permission issue — check chmod or run with correct user.';
+    if (/type error|typeerror/.test(c))                return 'Type mismatch — add explicit type assertions or runtime checks.';
+    return 'Review the error and ensure the implementation matches the plan in .planning/PLAN.md.';
+  }
+
+  /* ── Helpers ────────────────────────────────────────────────────── */
+
+  async _checkInstalled() {
+    try {
+      await execa('agentlightning', ['--version'], { stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * Helper for agents to emit a span (success signal) to Lightning.
+ * Agents call this at task completion via the zeroclaw CLI.
+ *   zeroclaw-emit --agent opencode --task "Add login form" --success
+ */
+async function emitSpan({ agent, task, success, error }) {
+  const workspace = process.cwd();
+  const spansDir  = path.join(workspace, '.zeroclaw', 'lightning-spans');
+  await fs.ensureDir(spansDir);
+  const spanFile  = path.join(spansDir, `${agent}-${Date.now()}.json`);
+  await fs.writeJson(spanFile, { agent, task, success: !!success, error, ts: Date.now() }, { spaces: 2 });
+}
+
+Lightning.emitSpan = emitSpan;
+module.exports     = Lightning;

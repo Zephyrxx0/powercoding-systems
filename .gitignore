@@ -1,4 +1,4 @@
-/nodemodules
+/node_modules
 package-lock.json
 .DS_Store
 dist
@@ -13,3 +13,4 @@ coverage
 *.swo
 *.bak   
 *.tmp
+WORKFLOW.md
